@@ -1,18 +1,26 @@
-mod sys;
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+
+mod sys {
+    #![allow(non_camel_case_types, non_upper_case_globals, unused, non_snake_case)]
+    include!("sys.rs");
+}
 
 macro_rules! rtlsdr_result {
-    ($ret:expr) => {
-        unsafe {
-            if $ret < 0 {
-                Err($ret)
+    ($expr:expr) => {{
+        let result = |ret: i32| -> Result<i32> {
+            if ret < 0 {
+                Err(RtlsdrError::from(ret))
             } else {
-                Ok($ret)
+                Ok(ret)
             }
-        }
-    };
+        };
+        result(unsafe { $expr })
+    }};
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// General error type for rtlsdr operations, which can be either a libusb error or
+/// some other unspecified error
 pub enum RtlsdrError {
     LibusbError(LibusbError),
     Unspecified(i32),
@@ -21,11 +29,13 @@ pub enum RtlsdrError {
 impl From<i32> for RtlsdrError {
     fn from(err: i32) -> Self {
         match LibusbError::try_from(err) {
-            Ok(e) => RtlsdrError::LibusbError(e),
-            Err(e) => RtlsdrError::Unspecified(e),
+            Ok(e) => Self::LibusbError(e),
+            Err(e) => Self::Unspecified(e),
         }
     }
 }
+
+pub type Result<T> = std::result::Result<T, RtlsdrError>;
 
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -61,21 +71,21 @@ pub enum LibusbError {
 impl TryFrom<i32> for LibusbError {
     type Error = i32;
 
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
+    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
         match value {
-            -1 => Ok(LibusbError::IoError),
-            -2 => Ok(LibusbError::InvalidParam),
-            -3 => Ok(LibusbError::AccessDenied),
-            -4 => Ok(LibusbError::NoDevice),
-            -5 => Ok(LibusbError::NoEntity),
-            -6 => Ok(LibusbError::Busy),
-            -7 => Ok(LibusbError::Timeout),
-            -8 => Ok(LibusbError::Overflow),
-            -9 => Ok(LibusbError::Pipe),
-            -10 => Ok(LibusbError::Interrupted),
-            -11 => Ok(LibusbError::InsufficientMemory),
-            -12 => Ok(LibusbError::NotSupported),
-            -99 => Ok(LibusbError::Other),
+            -1 => Ok(Self::IoError),
+            -2 => Ok(Self::InvalidParam),
+            -3 => Ok(Self::AccessDenied),
+            -4 => Ok(Self::NoDevice),
+            -5 => Ok(Self::NoEntity),
+            -6 => Ok(Self::Busy),
+            -7 => Ok(Self::Timeout),
+            -8 => Ok(Self::Overflow),
+            -9 => Ok(Self::Pipe),
+            -10 => Ok(Self::Interrupted),
+            -11 => Ok(Self::InsufficientMemory),
+            -12 => Ok(Self::NotSupported),
+            -99 => Ok(Self::Other),
             e => Err(e),
         }
     }
@@ -133,22 +143,20 @@ pub struct Device {
 }
 
 impl Device {
-    /// Open device
-    /// This may fail due to a libusb error or some other unspecified error
-    pub fn open(&mut self) -> Result<(), RtlsdrError> {
-        rtlsdr_result!(sys::rtlsdr_open(&mut self.dev, self.index))?;
+    /// Open a device
+    /// # Errors
+    /// This will return an error if the device cannot be opened by librtlsdr (e.g. libusb failure or device is already open)
+    pub fn open(&mut self) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_open(&raw mut self.dev, self.index))?;
 
         Ok(())
     }
 
-    // Close device
-    // This is called automatically when the Device is dropped
-    // This will return an error if the device is not open or already closed
-    pub fn close(&mut self) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_close(self.dev)).map_err(|e| match e {
-            -1 => "Device was not opened or already closed".to_string(),
-            _ => format!("Failed to close device: {}", e),
-        })?;
+    /// Close device
+    /// # Errors
+    /// This will return an error if the device cannot be closed by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn close(&mut self) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_close(self.dev))?;
 
         self.dev = std::ptr::null_mut();
 
@@ -157,16 +165,17 @@ impl Device {
 
     /// Get crystal oscillator frequencies used for the RTL2832 and the tuner IC
     /// Usually both ICs use the same clock.
-    pub fn get_xtal_freq(&self) -> Result<(u32, u32), String> {
+    /// # Errors
+    /// This will return an error if the frequencies cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_xtal_freq(&self) -> Result<(u32, u32)> {
         let mut rtl_freq = 0;
         let mut tuner_freq = 0;
 
         rtlsdr_result!(sys::rtlsdr_get_xtal_freq(
             self.dev,
-            &mut rtl_freq,
-            &mut tuner_freq
-        ))
-        .map_err(|e| format!("Failed to get crystal frequency: {}", e))?;
+            &raw mut rtl_freq,
+            &raw mut tuner_freq
+        ))?;
 
         Ok((rtl_freq, tuner_freq))
     }
@@ -175,123 +184,122 @@ impl Device {
     /// Usually both ICs use the same clock.
     /// Changing the clock may make sense if you are applying an external clock to the tuner
     /// or to compensate the frequency (and samplerate) error caused by the original (cheap) crystal.
+    ///
     /// NOTE: Call this function only if you fully understand the implications.
-    pub fn set_xtal_freq(&mut self, rtl_freq: u32, tuner_freq: u32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_xtal_freq(self.dev, rtl_freq, tuner_freq))
-            .map_err(|e| format!("Failed to set crystal frequency: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the frequencies cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_xtal_freq(&mut self, rtl_freq: u32, tuner_freq: u32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_xtal_freq(self.dev, rtl_freq, tuner_freq))?;
         Ok(())
     }
 
     /// Get USB device strings.
-    /// @return (manufacturer, product, serial) strings
-    pub fn get_usb_device_strings(&self) -> Result<(String, String, String), String> {
+    /// # Returns
+    /// (manufacturer, product, serial) strings
+    /// # Panics
+    /// This will panic if the retrieved strings from librtlsdr are not valid UTF-8 or if they are not null-terminated.
+    /// # Errors
+    /// This will return an error if the strings cannot be retrieved by librtlsdr (e
+    pub fn get_usb_device_strings(&self) -> Result<(String, String, String)> {
         let mut manufact = [0u8; 256];
         let mut product = [0u8; 256];
         let mut serial = [0u8; 256];
 
         rtlsdr_result!(sys::rtlsdr_get_usb_strings(
             self.dev,
-            manufact.as_mut_ptr() as *mut i8,
-            product.as_mut_ptr() as *mut i8,
-            serial.as_mut_ptr() as *mut i8
-        ))
-        .map_err(|e| format!("Failed to get usb device strings: {}", e))?;
+            manufact.as_mut_ptr().cast::<i8>(),
+            product.as_mut_ptr().cast::<i8>(),
+            serial.as_mut_ptr().cast::<i8>()
+        ))?;
 
-        let manufact = std::ffi::CStr::from_bytes_until_nul(&manufact)
-            .map_err(|e| format!("Failed to get usb device strings: {}", e))?
-            .to_str()
-            .expect("Failed to convert usb device string to str")
-            .to_string();
-        let product = std::ffi::CStr::from_bytes_until_nul(&product)
-            .map_err(|e| format!("Failed to get usb device strings: {}", e))?
-            .to_str()
-            .expect("Failed to convert usb device string to str")
-            .to_string();
-        let serial = std::ffi::CStr::from_bytes_until_nul(&serial)
-            .map_err(|e| format!("Failed to get usb device strings: {}", e))?
-            .to_str()
-            .expect("Failed to convert usb device string to str")
-            .to_owned();
+        let mps = [&manufact, &product, &serial].map(|s| {
+            std::ffi::CStr::from_bytes_until_nul(s)
+                .expect("usb device string is not null-terminated")
+                .to_str()
+                .expect("Failed to convert usb device string to str")
+                .to_string()
+        });
 
-        Ok((manufact, product, serial))
+        Ok(mps.into())
     }
 
     /// Read the device EEPROM
-    pub fn read_eeprom(&self, offset: u8, len: u16) -> Result<Vec<u8>, String> {
+    /// # Errors
+    /// This will return an error if the EEPROM cannot be read by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn read_eeprom(&self, offset: u8, len: u16) -> Result<Box<[u8]>> {
         let mut buf = vec![0u8; len as usize];
 
-        rtlsdr_result!(sys::rtlsdr_read_eeprom(
+        let n = rtlsdr_result!(sys::rtlsdr_read_eeprom(
             self.dev,
             buf.as_mut_ptr(),
             offset,
             len
-        ))
-        .map_err(|e| match e {
-            -1 => "Invalid Device".to_string(),
-            -2 => "EEPROM size exceeded".to_string(),
-            -3 => "No EEPROM found".to_string(),
-            _ => format!("Failed to read EEPROM: {}", e),
-        })?;
+        ))?;
 
-        Ok(buf)
+        #[allow(clippy::cast_sign_loss)]
+        // negative values are already handled by the error case above
+        buf.truncate(n as usize);
+
+        Ok(buf.into_boxed_slice())
     }
 
     /// Write the device EEPROM
-    pub fn write_eeprom(&mut self, offset: u8, buf: &mut [u8]) -> Result<(), String> {
+    /// # Errors
+    /// This will return an error if the EEPROM cannot be written by librtlsdr (e.g. libusb failure or device is not open)
+    /// # Panics
+    /// This will panic if the buffer length exceeds the maximum EEPROM size (65535 bytes)
+    pub fn write_eeprom(&mut self, offset: u8, buf: &mut [u8]) -> Result<()> {
+        let len = u16::try_from(buf.len()).expect("Buffer length exceeds maximum EEPROM size");
+
         rtlsdr_result!(sys::rtlsdr_write_eeprom(
             self.dev,
             buf.as_mut_ptr(),
             offset,
-            buf.len() as u16
-        ))
-        .map_err(|e| match e {
-            -1 => "Invalid Device".to_string(),
-            -2 => "EEPROM size exceeded".to_string(),
-            -3 => "No EEPROM found".to_string(),
-            _ => format!("Failed to write EEPROM: {}", e),
-        })?;
+            len
+        ))?;
 
         Ok(())
     }
 
     /// Get actual frequency the device is tuned to in Hz
-    pub fn get_center_freq(&self) -> Result<u32, String> {
+    /// # Errors
+    /// This will return an error if the frequency cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_center_freq(&self) -> Result<u32> {
         match unsafe { sys::rtlsdr_get_center_freq(self.dev) } {
-            0 => Err("Failed to get center frequency".to_string()),
+            0 => Err(RtlsdrError::Unspecified(0)),
             freq => Ok(freq),
         }
     }
 
     /// Set the frequency the device is tuned to in Hz
-    pub fn set_center_freq(&mut self, freq: u32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_center_freq(self.dev, freq))
-            .map_err(|e| format!("Failed to set center frequency: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the frequency cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_center_freq(&mut self, freq: u32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_center_freq(self.dev, freq))?;
         Ok(())
     }
 
     /// Get actual frequency correction value of the device.
-    /// @return correction value in parts per million (ppm)
+    /// Returns correction value in parts per million (ppm)
+    #[must_use]
     pub fn get_freq_correction(&self) -> i32 {
         unsafe { sys::rtlsdr_get_freq_correction(self.dev) }
     }
 
-    /// Set frequency correction value for the device.
-    /// @param ppm correction value in parts per million (ppm)
-    pub fn set_freq_correction(&mut self, ppm: i32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_freq_correction(self.dev, ppm))
-            .map_err(|e| format!("Failed to set frequency correction: {}", e))?;
-
+    /// Set frequency correction value for the device in parts per million (ppm)
+    /// # Errors
+    /// This will return an error if the frequency cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_freq_correction(&mut self, ppm: i32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_freq_correction(self.dev, ppm))?;
         Ok(())
     }
 
     /// Get the tuner type
+    #[must_use]
     pub fn get_tuner_type(&self) -> TunerType {
         let tuner_type = unsafe { sys::rtlsdr_get_tuner_type(self.dev) };
 
         match tuner_type {
-            0 => TunerType::Unknown,
             1 => TunerType::E4000,
             2 => TunerType::FC0012,
             3 => TunerType::FC0013,
@@ -304,244 +312,256 @@ impl Device {
 
     /// Get a list of gains supported by the tuner.
     /// Gain values in tenths of a dB, 115 means 11.5 dB
-    pub fn get_tuner_gains(&self) -> Vec<i32> {
-        let n = unsafe { sys::rtlsdr_get_tuner_gains(self.dev, std::ptr::null_mut()) };
+    /// # Errors
+    /// This will return an error if the frequency cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    #[allow(clippy::cast_sign_loss)]
+    pub fn get_tuner_gains(&self) -> Result<Vec<i32>> {
+        let n = rtlsdr_result!(sys::rtlsdr_get_tuner_gains(self.dev, std::ptr::null_mut()))?;
+
         let mut gains = vec![0i32; n as usize];
-        let n = unsafe { sys::rtlsdr_get_tuner_gains(self.dev, gains.as_mut_ptr()) };
+
+        let n = rtlsdr_result!(sys::rtlsdr_get_tuner_gains(self.dev, gains.as_mut_ptr()))?;
         gains.truncate(n as usize);
-        gains
+
+        Ok(gains)
     }
 
     /// Get actual (RF / HF) gain the device is configured to - excluding the IF gain.
     /// Gain in tenths of a dB, 115 means 11.5 dB.
-    /// unfortunately it's impossible to distinguish error against 0 dB
-    pub fn get_tuner_gain(&self) -> i32 {
-        unsafe { sys::rtlsdr_get_tuner_gain(self.dev) }
+    /// # Errors
+    /// This will return an error if the gain cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_tuner_gain(&self) -> Result<i32> {
+        match unsafe { sys::rtlsdr_get_tuner_gain(self.dev) } {
+            0 => Err(RtlsdrError::Unspecified(0)),
+            gain => Ok(gain),
+        }
     }
 
     /// Set the gain for the device.
     /// Manual gain mode must be enabled for this to work.
-    /// Valid gain values may be queried with rtlsdr_get_tuner_gains function.
+    /// Valid gain values may be queried with [`Device::get_tuner_gains`] function.
     /// Gain in tenths of a dB, 115 means 11.5 dB
-    pub fn set_tuner_gain(&mut self, gain: i32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_tuner_gain(self.dev, gain))
-            .map_err(|e| format!("Failed to set tuner gain: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the gain cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_tuner_gain(&mut self, gain: i32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_tuner_gain(self.dev, gain))?;
         Ok(())
     }
 
-    /// Set the bandwidth for the device.
-    /// @param bw bandwidth in Hz. Zero means automatic BW selection.
-    pub fn set_tuner_bandwidth(&mut self, bw: u32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_tuner_bandwidth(self.dev, bw,))
-            .map_err(|e| format!("Failed to set bandwidth: {}", e))?;
-
+    /// Set the bandwidth for the device in Hz. Zero means automatic BW selection.
+    /// # Errors
+    /// This will return an error if the bandwidth cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_tuner_bandwidth(&mut self, bw: u32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_tuner_bandwidth(self.dev, bw))?;
         Ok(())
     }
 
     /// Set the intermediate frequency gain for the device.
-    /// @param stage intermediate frequency gain stage number (1 to 6 for E4000)
-    /// @param gain in tenths of a dB, -30 means -3.0 dB.
-    pub fn set_tuner_if_gain(&mut self, stage: i32, gain: i32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_tuner_if_gain(self.dev, stage, gain))
-            .map_err(|e| format!("Failed to set IF gain: {}", e))?;
-
+    /// - `stage` intermediate frequency gain stage number (1 to 6 for E4000)
+    /// - `gain` in tenths of a dB, -30 means -3.0 dB.
+    /// # Errors
+    /// This will return an error if the IF gain cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_tuner_if_gain(&mut self, stage: i32, gain: i32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_tuner_if_gain(self.dev, stage, gain))?;
         Ok(())
     }
 
     /// Set the gain mode (automatic/manual) for the device.
     /// Manual gain mode must be enabled for the gain setter function to work.
-    pub fn set_tuner_gain_mode(&mut self, manual: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_tuner_gain_mode(self.dev, manual as i32))
-            .map_err(|e| format!("Failed to set tuner gain mode: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the gain mode cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_tuner_gain_mode(&mut self, manual: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_tuner_gain_mode(self.dev, i32::from(manual)))?;
         Ok(())
     }
 
-    /// Get actual sample rate the device is configured to.
-    /// @return sample rate in Hz
-    pub fn get_sample_rate(&self) -> Result<u32, String> {
+    /// Get actual sample rate the device is configured to in Hz
+    /// # Errors
+    /// This will return an error if the sample rate cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_sample_rate(&self) -> Result<u32> {
         match unsafe { sys::rtlsdr_get_sample_rate(self.dev) } {
-            0 => Err("Failed to get sample rate".to_string()),
+            0 => Err(RtlsdrError::Unspecified(0)),
             rate => Ok(rate),
         }
     }
 
-    /// Set the sample rate for the device.
-    /// @param rate sample rate in Hz
-    pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_sample_rate(self.dev, rate))
-            .map_err(|e| format!("Failed to set sample rate: {}", e))?;
-
+    /// Set the sample rate for the device in Hz
+    /// # Errors
+    /// This will return an error if the sample rate cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_sample_rate(&mut self, rate: u32) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_sample_rate(self.dev, rate))?;
         Ok(())
     }
 
     /// Enable test mode that returns an 8 bit counter instead of the samples.
     /// The counter is generated inside the RTL2832.
-    pub fn set_test_mode(&mut self, test_mode: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_testmode(self.dev, test_mode as i32))
-            .map_err(|e| format!("Failed to set test mode: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the test mode cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_test_mode(&mut self, test_mode: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_testmode(self.dev, i32::from(test_mode)))?;
         Ok(())
     }
 
     /// Enable or disable the internal digital AGC of the RTL2832.
-    pub fn set_agc_mode(&mut self, enabled: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_agc_mode(self.dev, enabled as i32))
-            .map_err(|e| format!("Failed to set agc mode: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the AGC mode cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_agc_mode(&mut self, enabled: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_agc_mode(self.dev, i32::from(enabled)))?;
         Ok(())
     }
 
     /// Get state of the direct sampling mode
-    pub fn get_direct_sampling(&self) -> Result<DirectSampling, String> {
-        rtlsdr_result!(sys::rtlsdr_get_direct_sampling(self.dev,))
-            .map_err(|e| format!("Failed to get direct sampling mode: {}", e))
-            .map(|mode| match mode {
-                0 => DirectSampling::Disabled,
-                1 => DirectSampling::I,
-                2 => DirectSampling::Q,
-                _ => DirectSampling::Disabled,
-            })
+    /// # Errors
+    /// This will return an error if the direct sampling mode cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_direct_sampling(&self) -> Result<DirectSampling> {
+        rtlsdr_result!(sys::rtlsdr_get_direct_sampling(self.dev)).map(|mode| match mode {
+            1 => DirectSampling::I,
+            2 => DirectSampling::Q,
+            _ => DirectSampling::Disabled,
+        })
     }
 
     /// Enable or disable the direct sampling mode.
-    /// When enabled, the IF mode of the RTL2832 is activated, and set_center_freq() will control the IF-frequency of the DDC,
+    /// When enabled, the IF mode of the RTL2832 is activated, and [`Device::set_center_freq()`] will control the IF-frequency of the DDC,
     /// which can be used to tune from 0 to 28.8 MHz (xtal frequency of the RTL2832).
-    pub fn set_direct_sampling(&mut self, mode: DirectSampling) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_direct_sampling(self.dev, mode as i32))
-            .map_err(|e| format!("Failed to set direct sampling mode: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the direct sampling mode cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_direct_sampling(&mut self, mode: DirectSampling) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_direct_sampling(self.dev, mode as i32))?;
         Ok(())
     }
 
     /// Get state of the offset tuning mode
-    pub fn get_offset_tuning(&self) -> Result<bool, String> {
-        rtlsdr_result!(sys::rtlsdr_get_offset_tuning(self.dev))
-            .map_err(|e| format!("Failed to get offset tuning mode: {}", e))
-            .map(|mode| mode == 1)
+    /// # Errors
+    /// This will return an error if the offset tuning mode cannot be retrieved by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn get_offset_tuning(&self) -> Result<bool> {
+        rtlsdr_result!(sys::rtlsdr_get_offset_tuning(self.dev)).map(|mode| mode == 1)
     }
 
     /// Enable or disable offset tuning for zero-IF tuners, which allows to avoid problems caused by the DC offset of the ADCs and 1/f noise.
-    pub fn set_offset_tuning(&mut self, enabled: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_offset_tuning(self.dev, enabled as i32))
-            .map_err(|e| format!("Failed to set offset tuning mode: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the offset tuning mode cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_offset_tuning(&mut self, enabled: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_offset_tuning(self.dev, i32::from(enabled)))?;
         Ok(())
     }
 
     /// Reset buffer in RTL2832
-    pub fn reset_buffer(&mut self) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_reset_buffer(self.dev))
-            .map_err(|e| format!("Failed to reset buffer: {}", e))?;
-
+    /// # Errors
+    /// This will return an error if the buffer cannot be reset by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn reset_buffer(&mut self) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_reset_buffer(self.dev))?;
         Ok(())
     }
 
     /// Read data synchronously
-    pub fn read_sync(&self, buf: &mut [u8]) -> Result<i32, RtlsdrError> {
+    /// Returns the number of bytes read.
+    /// # Errors
+    /// This will return an error if the samples cannot be read by librtlsdr (e.g. libusb failure or device is not open)
+    /// # Panics
+    /// This will panic if the buffer length exceeds the maximum value of i32 (2^31 - 1) bytes
+    pub fn read(&self, buf: &mut [u8]) -> Result<i32> {
+        let len = i32::try_from(buf.len()).expect("Buffer length exceeds maximum value of u32");
+
         let mut n_read = 0;
 
         rtlsdr_result!(sys::rtlsdr_read_sync(
             self.dev,
-            buf.as_mut_ptr() as *mut std::ffi::c_void,
-            buf.len() as i32,
-            &mut n_read
+            buf.as_mut_ptr().cast::<std::ffi::c_void>(),
+            len,
+            &raw mut n_read
         ))?;
 
         Ok(n_read)
     }
 
     /// Read samples from the device asynchronously.
-    /// This function will block until it is being canceled using rtlsdr_cancel_async()
-    /// NOTE: This function is deprecated and is subject for removal.
-    /// @param cb callback function to return received samples
-    /// @param ctx user specific context to pass via the callback function
-    #[deprecated]
-    pub fn wait_async<F>(&self, cb: F) -> Result<(), String>
+    /// This will block until the asynchronous reading is canceled.
+    ///
+    /// - `cb`: callback function to return received samples, which should return true to cancel further reading or false to continue reading.
+    /// - `buf_num` optional buffer count, `buf_num` * `buf_len` = overall buffer size set to 0 for default buffer count (15)
+    /// - `buf_len` optional buffer length, must be multiple of 512, should be a multiple of 16384 (URB size),
+    ///   set to 0 for default buffer length (16 * 32 * 512)
+    /// # Errors
+    /// This will return an error if the asynchronous reading cannot be started by librtlsdr (e.g. libusb failure or device is not open)
+    /// # Panics
+    /// This will panic if canceling the asynchronous reading from the callback fails
+    pub fn start_reading<F>(&self, mut cb: F, buf_num: u32, buf_len: u32) -> Result<()>
     where
-        F: FnMut(Vec<u8>),
+        F: FnMut(Vec<u8>) -> bool,
     {
-        self.read_async(cb, 0, 0)
-    }
+        struct Ctx<'a, F> {
+            callback: &'a mut F,
+            dev: *mut sys::rtlsdr_dev,
+        }
 
-    /// Read samples from the device asynchronously.
-    /// This function will block until it is being canceled using rtlsdr_cancel_async()
-    /// @param cb callback function to return received samples
-    /// @param buf_num optional buffer count, buf_num * buf_len = overall buffer size
-    /// set to 0 for default buffer count (15)
-    /// @param buf_len optional buffer length, must be multiple of 512,
-    /// should be a multiple of 16384 (URB size), set to 0 for default buffer length (16 * 32 * 512)
-    pub fn read_async<F>(&self, mut cb: F, buf_num: u32, buf_len: u32) -> Result<(), String>
-    where
-        F: FnMut(Vec<u8>),
-    {
         unsafe extern "C" fn _cb<F>(buf: *mut u8, len: u32, ctx: *mut std::ffi::c_void)
         where
-            F: FnMut(Vec<u8>),
+            F: FnMut(Vec<u8>) -> bool,
         {
-            let cb = &mut *(ctx as *mut F);
+            let ctx = &mut *ctx.cast::<Ctx<F>>();
+
             let mut vec = Vec::with_capacity(len as usize);
-            (0..len).for_each(|i| vec.push(*buf.offset(i as isize)));
-            cb(vec);
+
+            let ptr: *mut u8 = vec.as_mut_ptr();
+            ptr.copy_from_nonoverlapping(buf, len as usize);
+
+            vec.set_len(len as usize);
+
+            let cancel = (*ctx.callback)(vec);
+
+            if cancel {
+                rtlsdr_result!(sys::rtlsdr_cancel_async(ctx.dev))
+                    .expect("Failed to cancel async from callback");
+            }
         }
+
+        let mut ctx = Ctx {
+            callback: &mut cb,
+            dev: self.dev,
+        };
 
         rtlsdr_result!(sys::rtlsdr_read_async(
             self.dev,
             Some(_cb::<F>),
-            &mut cb as *mut F as *mut std::ffi::c_void,
+            (&raw mut ctx).cast::<std::ffi::c_void>(),
             buf_num,
             buf_len
-        ))
-        .map_err(|e| format!("Failed to wait async: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Cancel all pending asynchronous operations on the device.
-    /// Due to incomplete concurrency implementation, this should only be called from within the callback function, so it is
-    /// in the correct thread.
-    pub fn cancel_async(&self) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_cancel_async(self.dev))
-            .map_err(|e| format!("Failed to cancel async: {}", e))?;
+        ))?;
 
         Ok(())
     }
 
     /// Enable or disable (the bias tee on) GPIO PIN 0 - if not reconfigured.
-    /// See rtlsdr_set_opt_string() option 'T'.
-    /// This works for rtl-sdr.com v3 dongles, see http://www.rtl-sdr.com/rtl-sdr-blog-v-3-dongles-user-guide/
-    /// Note: rtlsdr_close() does not clear GPIO lines, so it leaves the (bias tee) line enabled if a client program
+    /// This works for rtl-sdr.com v3 dongles, see <http://www.rtl-sdr.com/rtl-sdr-blog-v-3-dongles-user-guide/>
+    /// Note: [`Device::close()`] does not clear GPIO lines, so it leaves the (bias tee) line enabled if a client program
     /// doesn't explictly disable it.
-    pub fn set_bias_tee(&mut self, on: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_bias_tee(self.dev, on as i32)).map_err(|e| match e {
-            -1 => "Device is not initialized".to_string(),
-            _ => format!("Failed to set bias tee: {}", e),
-        })?;
-
+    /// # Errors
+    /// This will return an error if the bias tee cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_bias_tee(&mut self, on: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_bias_tee(self.dev, i32::from(on)))?;
         Ok(())
     }
 
     /// Enable or disable (the bias tee on) the given GPIO pin.
-    /// Note: rtlsdr_close() does not clear GPIO lines, so it leaves the (bias tee) lines enabled if a client program
+    /// Note: [`Device::close()`] does not clear GPIO lines, so it leaves the (bias tee) lines enabled if a client program
     /// doesn't explictly disable it.
-    /// @param gpio the gpio pin -- assuming this line is connected to Bias T.
-    /// gpio needs to be in 0 .. 7. BUT pin 4 is connected to Tuner RESET.
-    /// and for FC0012 is already connected/reserved pin 6 for switching V/U-HF.
-    /// @param on: 1 for Bias T on. 0 for Bias T off.
-    pub fn set_bias_tee_gpio(&mut self, gpio: i32, on: bool) -> Result<(), String> {
-        rtlsdr_result!(sys::rtlsdr_set_bias_tee_gpio(self.dev, gpio, on as i32)).map_err(|e| {
-            match e {
-                -1 => "Device is not initialized".to_string(),
-                _ => format!("Failed to set bias tee gpio: {}", e),
-            }
-        })?;
-
+    /// - `gpio_pin` needs to be in 0 .. 7. BUT pin 4 is connected to Tuner RESET.
+    ///   and for FC0012 is already connected/reserved pin 6 for switching V/U-HF.
+    /// # Errors
+    /// This will return an error if the bias tee cannot be set by librtlsdr (e.g. libusb failure or device is not open)
+    pub fn set_bias_tee_gpio(&mut self, gpio_pin: i32, on: bool) -> Result<()> {
+        rtlsdr_result!(sys::rtlsdr_set_bias_tee_gpio(
+            self.dev,
+            gpio_pin,
+            i32::from(on)
+        ))?;
         Ok(())
     }
 }
 
 #[doc = "Get all available devices"]
+#[must_use]
 pub fn get_devices() -> Vec<Device> {
     let n = unsafe { sys::rtlsdr_get_device_count() };
 
